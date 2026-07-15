@@ -75,11 +75,20 @@ pub unsafe fn on_interrupt(r: Otg, state: &State<'_>) {
             vals::Pktstsd::OUT_DATA_RX => {
                 trace!("OUT_DATA_RX ep={} len={}", ep_num, len);
 
-                if state.ep_states[ep_num].out_size.load(Ordering::Acquire) == EP_OUT_BUFFER_EMPTY {
-                    // SAFETY: Buffer size is allocated to be equal to endpoint's maximum packet size
-                    // We trust the peripheral to not exceed its configured MPSIZ
-                    let buf =
-                        unsafe { core::slice::from_raw_parts_mut(*state.ep_states[ep_num].out_buffer.get(), len) };
+                let ep_state = &state.ep_states[ep_num];
+                let slot_count = ep_state.out_slot_count.load(Ordering::Relaxed);
+                if ep_state.out_used.load(Ordering::Acquire) < slot_count {
+                    let stride = ep_state.out_slot_stride.load(Ordering::Relaxed) as usize;
+                    let wr_idx = ep_state.out_wr_idx.load(Ordering::Relaxed) as usize;
+
+                    // SAFETY: `out_used < slot_count` guarantees this slot is free, and the
+                    // hardware is never armed for more packets than there are free slots.
+                    // We trust the peripheral to not exceed its configured MPSIZ.
+                    let buf = unsafe {
+                        let slot = (*ep_state.out_buffer.get()).add(wr_idx * stride);
+                        core::ptr::copy_nonoverlapping((len as u16).to_ne_bytes().as_ptr(), slot, 2);
+                        core::slice::from_raw_parts_mut(slot.add(OUT_SLOT_HEADER), len)
+                    };
 
                     let mut chunks = buf.chunks_exact_mut(4);
                     for chunk in &mut chunks {
@@ -93,8 +102,9 @@ pub unsafe fn on_interrupt(r: Otg, state: &State<'_>) {
                         rem.copy_from_slice(&data.to_ne_bytes()[0..rem.len()]);
                     }
 
-                    state.ep_states[ep_num].out_size.store(len as u16, Ordering::Release);
-                    state.ep_states[ep_num].out_waker.wake();
+                    ep_state.out_wr_idx.store(((wr_idx + 1) % slot_count as usize) as u16, Ordering::Relaxed);
+                    ep_state.out_used.fetch_add(1, Ordering::Release);
+                    ep_state.out_waker.wake();
                 } else {
                     error!("ep_out buffer overflow index={}", ep_num);
 
@@ -107,6 +117,18 @@ pub unsafe fn on_interrupt(r: Otg, state: &State<'_>) {
             }
             vals::Pktstsd::OUT_DATA_DONE => {
                 trace!("OUT_DATA_DONE ep={}", ep_num);
+
+                // The armed transfer completed (packet count exhausted or short packet received).
+                // For multi-slot endpoints, re-arm right away for however many slots are free so
+                // the bus stalls as briefly as possible. Single-slot endpoints (including EP0)
+                // keep the classic re-arm-on-read behavior.
+                let ep_state = &state.ep_states[ep_num];
+                ep_state.out_armed.store(false, Ordering::Relaxed);
+                if ep_state.out_slot_count.load(Ordering::Relaxed) > 1 {
+                    if let Some(ep) = state.ep_alloc_get(Direction::Out, ep_num) {
+                        rearm_out_endpoint(r, ep_state, ep_num, ep.max_packet_size);
+                    }
+                }
             }
             vals::Pktstsd::SETUP_DATA_DONE => {
                 trace!("SETUP_DATA_DONE ep={}", ep_num);
@@ -265,16 +287,30 @@ impl PhyType {
     }
 }
 
-/// Indicates that [State::ep_out_buffers] is empty.
-const EP_OUT_BUFFER_EMPTY: u16 = u16::MAX;
+/// Size in bytes of the length header stored at the start of each OUT ring buffer slot.
+/// The header holds the packet length in its first two bytes; 4 bytes keeps slots word-aligned.
+const OUT_SLOT_HEADER: usize = 4;
 
 struct EpState {
     in_waker: AtomicWaker,
     out_waker: AtomicWaker,
     /// RX FIFO is shared so extra buffers are needed to dequeue all data without waiting on each endpoint.
-    /// Buffers are ready when associated [State::ep_out_size] != [EP_OUT_BUFFER_EMPTY].
+    ///
+    /// The buffer is a ring of `out_slot_count` slots of `out_slot_stride` bytes each. Each slot
+    /// holds one packet prefixed by a [`OUT_SLOT_HEADER`]-byte length header. The interrupt
+    /// handler fills slots at `out_wr_idx`, `read()` drains them at `out_rd_idx`, and `out_used`
+    /// counts filled slots and synchronizes the two sides.
     out_buffer: UnsafeCell<*mut u8>,
-    out_size: AtomicU16,
+    out_slot_count: AtomicU16,
+    out_slot_stride: AtomicU16,
+    /// Next slot the interrupt handler writes to. Only written by the interrupt handler.
+    out_wr_idx: AtomicU16,
+    /// Next slot `read()` consumes. Only written by `read()`.
+    out_rd_idx: AtomicU16,
+    /// Number of filled slots. Incremented by the interrupt handler, decremented by `read()`.
+    out_used: AtomicU16,
+    /// Whether an OUT transfer is currently armed in hardware (multi-slot endpoints only).
+    out_armed: AtomicBool,
     // Written once during endpoint allocation (before Driver::start), read-only afterward.
     in_alloc: UnsafeCell<Option<EndpointData>>,
     out_alloc: UnsafeCell<Option<EndpointData>>,
@@ -391,7 +427,12 @@ impl<const EP_COUNT: usize> StateStorage<EP_COUNT> {
                     in_waker: AtomicWaker::new(),
                     out_waker: AtomicWaker::new(),
                     out_buffer: UnsafeCell::new(0 as _),
-                    out_size: AtomicU16::new(EP_OUT_BUFFER_EMPTY),
+                    out_slot_count: AtomicU16::new(1),
+                    out_slot_stride: AtomicU16::new(0),
+                    out_wr_idx: AtomicU16::new(0),
+                    out_rd_idx: AtomicU16::new(0),
+                    out_used: AtomicU16::new(0),
+                    out_armed: AtomicBool::new(false),
                     in_alloc: UnsafeCell::new(None),
                     out_alloc: UnsafeCell::new(None),
                 }
@@ -437,6 +478,17 @@ pub struct Config {
     /// enumerates in FS mode. Some USB Link IP like those in the STM32H7 series support adding this delay to work with
     /// the affected PHYs.
     pub xcvrdly: bool,
+
+    /// Number of packets buffered per bulk OUT endpoint (default 1).
+    ///
+    /// When set above 1, each bulk OUT endpoint gets a ring of this many packet buffers and the
+    /// hardware is armed to accept that many packets back-to-back, without software intervention
+    /// between packets. This significantly improves bulk OUT throughput, especially in high-speed
+    /// mode where the per-packet turnaround otherwise leaves the bus NAK-ing most of the time.
+    ///
+    /// Each bulk OUT endpoint consumes `out_burst_packets * (max_packet_size + 4)` bytes of the
+    /// `ep_out_buffer` passed to the driver, so size it accordingly.
+    pub out_burst_packets: u8,
 }
 
 impl Default for Config {
@@ -444,6 +496,7 @@ impl Default for Config {
         Self {
             vbus_detection: false,
             xcvrdly: false,
+            out_burst_packets: 1,
         }
     }
 }
@@ -462,7 +515,8 @@ impl<'d> Driver<'d> {
     /// # Arguments
     ///
     /// * `ep_out_buffer` - An internal buffer used to temporarily store received packets.
-    /// Must be large enough to fit all OUT endpoint max packet sizes.
+    /// Must be large enough to fit all OUT endpoint max packet sizes, each plus a 4-byte header
+    /// (and multiplied by [`Config::out_burst_packets`] for bulk OUT endpoints).
     /// Endpoint allocation will fail if it is too small.
     /// * `instance` - The USB OTG peripheral instance and its configuration.
     /// * `config` - The USB driver configuration.
@@ -497,15 +551,28 @@ impl<'d> Driver<'d> {
             D::dir()
         );
 
+        // Bulk OUT endpoints get a ring of `out_burst_packets` slots so the hardware can be armed
+        // for multiple packets at once; other endpoint types keep the classic single slot.
+        let slot_count: u16 = match (D::dir(), ep_type) {
+            (Direction::Out, EndpointType::Bulk) => u16::max(self.config.out_burst_packets as u16, 1),
+            (Direction::Out, _) => 1,
+            (Direction::In, _) => 0,
+        };
+        // Length header + packet data, rounded up to keep slots word-aligned.
+        let slot_stride = OUT_SLOT_HEADER + ((max_packet_size as usize + 3) & !3);
+
         if D::dir() == Direction::Out {
-            if self.ep_out_buffer_offset + max_packet_size as usize > self.ep_out_buffer.len() {
+            if self.ep_out_buffer_offset + slot_count as usize * slot_stride > self.ep_out_buffer.len() {
                 error!("Not enough endpoint out buffer capacity");
                 return Err(EndpointAllocError);
             }
         };
 
         let fifo_size_words = match D::dir() {
-            Direction::Out => (max_packet_size + 3) / 4,
+            // Multi-slot endpoints get extra room in the shared RX FIFO so packets can keep
+            // arriving while the interrupt handler drains earlier ones. Capped at 3 packets:
+            // the sustained rate is limited by the drain speed, not FIFO depth.
+            Direction::Out => (max_packet_size + 3) / 4 * u16::min(slot_count, 3),
             // INEPTXFD requires minimum size of 16 words
             Direction::In => u16::max((max_packet_size + 3) / 4, 16),
         };
@@ -572,7 +639,9 @@ impl<'d> Driver<'d> {
             unsafe {
                 *ep_state.out_buffer.get() = self.ep_out_buffer.as_mut_ptr().offset(self.ep_out_buffer_offset as _);
             }
-            self.ep_out_buffer_offset += max_packet_size as usize;
+            ep_state.out_slot_count.store(slot_count, Ordering::Relaxed);
+            ep_state.out_slot_stride.store(slot_stride as u16, Ordering::Relaxed);
+            self.ep_out_buffer_offset += slot_count as usize * slot_stride;
         }
 
         Ok(Endpoint {
@@ -1162,18 +1231,17 @@ impl<'d> embassy_usb_driver::Bus for Bus<'d> {
                         w.set_usbaep(enabled);
                     });
 
-                    // When re-enabling a non-EP0 OUT endpoint, prime it to receive a packet.
+                    // When re-enabling a non-EP0 OUT endpoint, prime it to receive.
                     // Without this, the endpoint stays idle after reconnect and silently drops data.
                     if enabled && ep_addr.index() != 0 {
                         if let Some(ep) = st.ep_alloc_get(Direction::Out, ep_addr.index()) {
-                            regs.doeptsiz(ep_addr.index()).modify(|w| {
-                                w.set_xfrsiz(ep.max_packet_size as _);
-                                w.set_pktcnt(1);
-                            });
-                            regs.doepctl(ep_addr.index()).modify(|w| {
-                                w.set_cnak(true);
-                                w.set_epena(true);
-                            });
+                            // Discard any stale packets received before the endpoint was re-enabled.
+                            let ep_state = &st.ep_states[ep_addr.index()];
+                            ep_state.out_wr_idx.store(0, Ordering::Relaxed);
+                            ep_state.out_rd_idx.store(0, Ordering::Relaxed);
+                            ep_state.out_used.store(0, Ordering::Relaxed);
+                            ep_state.out_armed.store(false, Ordering::Relaxed);
+                            rearm_out_endpoint(regs, ep_state, ep_addr.index(), ep.max_packet_size);
                         }
                     }
                 });
@@ -1342,23 +1410,37 @@ impl<'d> embassy_usb_driver::EndpointOut for Endpoint<'d, Out> {
                 return Poll::Ready(Err(EndpointError::Disabled));
             }
 
-            let len = self.state.out_size.load(Ordering::Acquire);
-            if len != EP_OUT_BUFFER_EMPTY {
-                trace!("read ep={:?} done len={}", self.info.addr, len);
+            if self.state.out_used.load(Ordering::Acquire) == 0 {
+                return Poll::Pending;
+            }
 
-                if len as usize > buf.len() {
+            let slot_count = self.state.out_slot_count.load(Ordering::Relaxed);
+            let stride = self.state.out_slot_stride.load(Ordering::Relaxed) as usize;
+            let rd_idx = self.state.out_rd_idx.load(Ordering::Relaxed) as usize;
+
+            // SAFETY: `out_used > 0` guarantees this slot was filled by the interrupt handler,
+            // which won't touch it again until `out_used` is decremented below.
+            let len = unsafe {
+                let slot = (*self.state.out_buffer.get()).add(rd_idx * stride);
+                let mut len_bytes = [0u8; 2];
+                core::ptr::copy_nonoverlapping(slot, len_bytes.as_mut_ptr(), 2);
+                let len = u16::from_ne_bytes(len_bytes) as usize;
+
+                if len > buf.len() {
                     return Poll::Ready(Err(EndpointError::BufferOverflow));
                 }
+                core::ptr::copy_nonoverlapping(slot.add(OUT_SLOT_HEADER), buf.as_mut_ptr(), len);
+                len
+            };
+            trace!("read ep={:?} done len={}", self.info.addr, len);
 
-                // SAFETY: exclusive access ensured by `out_size` atomic variable
-                let data = unsafe { core::slice::from_raw_parts(*self.state.out_buffer.get(), len as usize) };
-                buf[..len as usize].copy_from_slice(data);
+            // Release the slot
+            self.state.out_rd_idx.store(((rd_idx + 1) % slot_count as usize) as u16, Ordering::Relaxed);
+            self.state.out_used.fetch_sub(1, Ordering::Release);
 
-                // Release buffer
-                self.state.out_size.store(EP_OUT_BUFFER_EMPTY, Ordering::Release);
-
-                critical_section::with(|_| {
-                    // Receive 1 packet
+            critical_section::with(|_| {
+                if slot_count == 1 {
+                    // Classic single-slot behavior: receive 1 packet
                     self.regs.doeptsiz(index).modify(|w| {
                         w.set_xfrsiz(self.info.max_packet_size as _);
                         w.set_pktcnt(1);
@@ -1383,12 +1465,13 @@ impl<'d> embassy_usb_driver::EndpointOut for Endpoint<'d, Out> {
                     self.regs.doepctl(index).modify(|w| {
                         w.set_cnak(true);
                     });
-                });
+                } else if !self.state.out_armed.load(Ordering::Relaxed) {
+                    // The hardware went idle while all slots were full; re-arm now that one is free.
+                    rearm_out_endpoint(self.regs, self.state, index, self.info.max_packet_size);
+                }
+            });
 
-                Poll::Ready(Ok(len as usize))
-            } else {
-                Poll::Pending
-            }
+            Poll::Ready(Ok(len))
         })
         .await
     }
@@ -1604,6 +1687,28 @@ impl<'d> embassy_usb_driver::ControlPipe for ControlPipe<'d> {
         // synopsys driver requires accept to be sent after changing address
         self.accept().await
     }
+}
+
+/// (Re-)arms an OUT endpoint to receive as many packets as there are free ring buffer slots.
+///
+/// Must be called from the interrupt handler or from within a critical section.
+fn rearm_out_endpoint(r: Otg, ep_state: &EpState, index: usize, max_packet_size: u16) {
+    let slot_count = ep_state.out_slot_count.load(Ordering::Relaxed);
+    let free = slot_count - ep_state.out_used.load(Ordering::Acquire);
+    if free == 0 {
+        // All slots are full: stay NAKed until `read()` frees a slot and re-arms.
+        return;
+    }
+
+    r.doeptsiz(index).modify(|w| {
+        w.set_xfrsiz(free as u32 * max_packet_size as u32);
+        w.set_pktcnt(free);
+    });
+    r.doepctl(index).modify(|w| {
+        w.set_cnak(true);
+        w.set_epena(true);
+    });
+    ep_state.out_armed.store(true, Ordering::Relaxed);
 }
 
 /// Translates HAL [EndpointType] into PAC [vals::Eptyp]

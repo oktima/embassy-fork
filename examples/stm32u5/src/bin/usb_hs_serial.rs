@@ -48,8 +48,12 @@ async fn main(_spawner: Spawner) {
     });
 
     // Create the driver, from the HAL.
-    let mut ep_out_buffer = [0u8; 1024];
+    // Sized for the control EP (64+4 bytes) plus a 16-packet bulk OUT ring (16 * (512+4) bytes).
+    let mut ep_out_buffer = [0u8; 8448];
     let mut config = embassy_stm32::usb::Config::default();
+    // Buffer up to 16 bulk OUT packets in hardware before software must intervene.
+    // This lets the host burst packets back-to-back instead of NAK-ing after every packet.
+    config.out_burst_packets = 16;
     // Do not enable vbus_detection. This is a safe default that works in all boards.
     // However, if your USB device is self-powered (can stay powered on if USB is unplugged), you need
     // to enable vbus_detection to comply with the USB spec. If you enable it, the board
