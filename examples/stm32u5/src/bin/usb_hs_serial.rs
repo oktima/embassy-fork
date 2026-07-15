@@ -7,6 +7,7 @@ use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_stm32::usb::{Driver, Instance};
 use embassy_stm32::{Config, bind_interrupts, peripherals, usb};
+use embassy_time::{Duration, Instant};
 use embassy_usb::Builder;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::driver::EndpointError;
@@ -42,6 +43,9 @@ async fn main(_spawner: Spawner) {
     }
 
     let p = embassy_stm32::init(config);
+    embassy_stm32::pac::ICACHE.cr().write(|w| {
+        w.set_en(true);
+    });
 
     // Create the driver, from the HAL.
     let mut ep_out_buffer = [0u8; 1024];
@@ -86,19 +90,19 @@ async fn main(_spawner: Spawner) {
     // Run the USB device.
     let usb_fut = usb.run();
 
-    // Do stuff with the class!
-    let echo_fut = async {
+    // Sink all incoming data and report the receive rate over defmt.
+    let sink_fut = async {
         loop {
             class.wait_connection().await;
             info!("Connected");
-            let _ = echo(&mut class).await;
+            let _ = sink(&mut class).await;
             info!("Disconnected");
         }
     };
 
     // Run everything concurrently.
     // If we had made everything `'static` above instead, we could do this using separate tasks instead.
-    join(usb_fut, echo_fut).await;
+    join(usb_fut, sink_fut).await;
 }
 
 struct Disconnected {}
@@ -112,12 +116,31 @@ impl From<EndpointError> for Disconnected {
     }
 }
 
-async fn echo<'d, T: Instance + 'd>(class: &mut CdcAcmClass<'d, Driver<'d, T>>) -> Result<(), Disconnected> {
+/// Reads and discards all incoming data, logging throughput once per second.
+async fn sink<'d, T: Instance + 'd>(class: &mut CdcAcmClass<'d, Driver<'d, T>>) -> Result<(), Disconnected> {
     let mut buf = [0; 512];
+    let mut total: u64 = 0;
+    let mut window_bytes: u32 = 0;
+    let mut window_packets: u32 = 0;
+    let mut window_start = Instant::now();
     loop {
         let n = class.read_packet(&mut buf).await?;
-        let data = &buf[..n];
-        // info!("data: {:x}", data);
-        class.write_packet(data).await?;
+        total += n as u64;
+        window_bytes += n as u32;
+        window_packets += 1;
+        // Check the clock only every 64 packets to keep per-packet overhead low.
+        if window_packets % 64 == 0 {
+            let elapsed = window_start.elapsed();
+            if elapsed >= Duration::from_secs(1) {
+                let kb_per_s = window_bytes as u64 / elapsed.as_millis() as u64;
+                info!(
+                    "RX: {} kB/s ({} packets, {} bytes total)",
+                    kb_per_s, window_packets, total
+                );
+                window_bytes = 0;
+                window_packets = 0;
+                window_start = Instant::now();
+            }
+        }
     }
 }
